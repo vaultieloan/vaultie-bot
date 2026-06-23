@@ -13,7 +13,7 @@ Run:  python bot.py   (long-polling; deploy as a Railway "worker" service)
 """
 import os, re, time, logging
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           ConversationHandler, ContextTypes, filters)
@@ -114,16 +114,58 @@ def menu():
         [InlineKeyboardButton("💸 Borrow SOL", callback_data="borrow")],
         [InlineKeyboardButton("📊 My positions", callback_data="positions"),
          InlineKeyboardButton("📈 Stats", callback_data="stats")],
-        [InlineKeyboardButton("📄 Docs", url=f"{SITE}/docs.html"),
-         InlineKeyboardButton("🌐 Open app", url=f"{SITE}/markets.html")],
+        [InlineKeyboardButton("📖 How it works", callback_data="help"),
+         InlineKeyboardButton("⏱ Terms", callback_data="terms")],
+        [InlineKeyboardButton("🌐 Open app", url=f"{SITE}/markets.html"),
+         InlineKeyboardButton("📄 Docs", url=f"{SITE}/docs.html")],
     ])
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "*Vaultie* — draw SOL against your Pump.fun tokens, without selling.\n\n"
-        "Lock a bonded token, get a SOL credit, repay to unlock. Custodial MVP — high risk.\n\n"
-        "What do you want to do?",
+        "🪶 *Vaultie* — the lending desk for your Pump.fun bags.\n\n"
+        "Lock a bonded token → draw SOL → repay to unlock. *No selling, ever.*\n\n"
+        "• Up to 25% LTV · interest fixed by term\n"
+        "• Overcollateralized — a dip won't wipe you\n"
+        "• Custodial MVP — high risk, size accordingly\n\n"
+        "Tap below, or type /borrow to start.",
         parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.callback_query.message if update.callback_query else update.effective_message
+    if update.callback_query: await update.callback_query.answer()
+    await m.reply_text(
+        "*How Vaultie works*\n\n"
+        "1️⃣ */borrow* — paste a bonded Pump.fun token, choose how many to lock and a term.\n"
+        "2️⃣ Send the tokens to the lock address the bot gives you.\n"
+        "3️⃣ A *SOL credit* is sent back to the wallet you sent from — automatically, on-chain.\n"
+        "4️⃣ */positions* → *Repay* to send SOL back and unlock your tokens.\n\n"
+        "*Good to know*\n"
+        "• Interest is fixed by your term (2h–1mo); shorter is cheaper.\n"
+        "• Miss the term, or price drops −50% → collateral is liquidated.\n"
+        "• No wallet connection — the deposit *is* the action.\n"
+        "• Custodial MVP: you trust the operator, not a contract. High risk.\n\n"
+        "Quick commands: /borrow · /positions · /repay · /terms · /stats",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
+
+async def terms_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.callback_query.message if update.callback_query else update.effective_message
+    if update.callback_query: await update.callback_query.answer()
+    await refresh_terms()
+    rows = "\n".join(
+        f"• *{t['label']}* — {t['interest']*100:.0f}% interest"
+        + ("  _(default)_" if t["key"] == DEFAULT_TERM else "")
+        for t in TERMS)
+    await m.reply_text(
+        "*Loan terms*\n\n" + rows +
+        "\n\nRepay credit + interest before the term ends to unlock. "
+        "Miss it and the collateral is forfeited.\n\nStart with /borrow.",
+        parse_mode=ParseMode.MARKDOWN)
+
+async def repay_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "To repay, send the *wallet you borrowed from* — I'll pull up your open loans "
+        "with a Repay button for each.", parse_mode=ParseMode.MARKDOWN)
+    ctx.user_data["awaiting_wallet"] = True
 
 async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
@@ -381,12 +423,26 @@ async def route_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.data == "stats": await q.answer(); return await stats(update, ctx)
     if q.data == "positions": return await positions_entry(update, ctx)
+    if q.data == "help": return await help_cmd(update, ctx)
+    if q.data == "terms": return await terms_cmd(update, ctx)
+
+
+async def _post_init(app):
+    await app.bot.set_my_commands([
+        BotCommand("borrow",    "Lock a token, draw SOL"),
+        BotCommand("positions", "View your loans"),
+        BotCommand("repay",     "Repay a loan to unlock"),
+        BotCommand("terms",     "Loan terms & interest"),
+        BotCommand("stats",     "Protocol stats"),
+        BotCommand("help",      "How Vaultie works"),
+    ])
+    log.info("bot commands registered")
 
 
 def main():
     if not TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN")
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(_post_init).build()
     conv = ConversationHandler(
         entry_points=[CommandHandler("borrow", borrow_entry),
                       CallbackQueryHandler(borrow_entry, pattern="^borrow$")],
@@ -400,10 +456,12 @@ def main():
     )
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("terms", terms_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("positions", positions_entry))
-    app.add_handler(CallbackQueryHandler(route_buttons, pattern="^(stats|positions)$"))
+    app.add_handler(CommandHandler("repay", repay_entry))
+    app.add_handler(CallbackQueryHandler(route_buttons, pattern="^(stats|positions|help|terms)$"))
     app.add_handler(CallbackQueryHandler(on_repay, pattern="^repay:"))
     app.add_handler(CallbackQueryHandler(on_refresh, pattern="^refresh:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_wallet))
