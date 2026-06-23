@@ -472,9 +472,14 @@ async def admin_route(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not loans:
                 await q.message.reply_text("No loans." if act == "loans" else "No stuck loans ✅")
                 return
-            lines = [f"`{l['id']}` · ${l.get('symbol','?')} · _{l.get('status')}_"
-                     + (f"\n   ↳ {l['watchNote']}" if l.get('watchNote') else "")
-                     for l in loans[-15:]]
+            clean = lambda s: str(s).replace("_", " ").replace("*", "").replace("`", "")
+            lines = []
+            for l in loans[-15:]:
+                note = l.get("watchNote") or l.get("repayNote") or (("cap:" + l["held"]) if l.get("held") else "")
+                row = f"`{l.get('id','?')}` · ${clean(l.get('symbol','?'))} · {clean(l.get('status','?'))}"
+                if note:
+                    row += f"\n   ↳ {clean(note)}"
+                lines.append(row)
             await q.message.reply_text(
                 f"*{'Stuck' if act=='stuck' else 'Loans'}* ({len(loans)})\n" + "\n".join(lines)
                 + "\n\nRefund: `/refund <id> <wallet>`", parse_mode=ParseMode.MARKDOWN)
