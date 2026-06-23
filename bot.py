@@ -13,7 +13,7 @@ Run:  python bot.py   (long-polling; deploy as a Railway "worker" service)
 """
 import os, re, time, logging
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           ConversationHandler, ContextTypes, filters)
@@ -24,6 +24,8 @@ log = logging.getLogger("vaultie.bot")
 API  = os.getenv("VAULTIE_API", "http://localhost:8000/api").rstrip("/")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 SITE = os.getenv("VAULTIE_SITE", "https://vaultie.fun")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "6211579235").replace(" ", "").split(",") if x.strip().isdigit()}
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 # protocol params (mirror backend defaults; quote is recomputed on-chain at deposit)
 LTV, LTV_BOOST, INTEREST, LIQ_DROP, CAP = 0.10, 0.15, 0.05, 0.50, 0.10
@@ -419,6 +421,86 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Cancelled.")
     return ConversationHandler.END
 
+# ----------------- admin (by Telegram ID) -----------------
+def is_admin(update: Update) -> bool:
+    u = update.effective_user
+    return bool(u and u.id in ADMIN_IDS)
+
+def admin_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Engine", callback_data="adm:status"),
+         InlineKeyboardButton("💾 Volume", callback_data="adm:health")],
+        [InlineKeyboardButton("📋 All loans", callback_data="adm:loans"),
+         InlineKeyboardButton("⚠️ Stuck", callback_data="adm:stuck")],
+    ])
+
+async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.effective_message.reply_text(
+        f"*Vaultie admin* · id `{update.effective_user.id}`\nOperator controls.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+
+async def admin_route(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(update):
+        return await q.answer("Not authorized", show_alert=True)
+    await q.answer()
+    act = q.data.split(":", 1)[1]
+    try:
+        if act == "status":
+            s = await _get("/engine/status")
+            await q.message.reply_text(
+                "*Engine*\n"
+                f"ready: `{s.get('ready')}`\ndryRun: `{s.get('dryRun')}`\n"
+                f"treasurySet: `{s.get('treasurySet')}`\nmanualApproval: `{s.get('manualApproval')}`",
+                parse_mode=ParseMode.MARKDOWN)
+        elif act == "health":
+            h = await _get("/admin/health", {"key": ADMIN_KEY})
+            await q.message.reply_text(
+                "*Volume health*\n"
+                f"dataDir: `{h.get('dataDir')}`\nonVolume: `{h.get('dataDirOnVolume')}`\n"
+                f"writable: `{h.get('writable')}`\nloans in db: `{h.get('loanCount')}`",
+                parse_mode=ParseMode.MARKDOWN)
+        elif act in ("loans", "stuck"):
+            d = await _get("/admin/loans", {"key": ADMIN_KEY})
+            loans = d.get("loans", [])
+            if act == "stuck":
+                loans = [l for l in loans if l.get("status") in
+                         ("awaiting_repayment", "pending_deposit", "awaiting_deposit", "held")
+                         or l.get("watchNote")]
+            if not loans:
+                await q.message.reply_text("No loans." if act == "loans" else "No stuck loans ✅")
+                return
+            lines = [f"`{l['id']}` · ${l.get('symbol','?')} · _{l.get('status')}_"
+                     + (f"\n   ↳ {l['watchNote']}" if l.get('watchNote') else "")
+                     for l in loans[-15:]]
+            await q.message.reply_text(
+                f"*{'Stuck' if act=='stuck' else 'Loans'}* ({len(loans)})\n" + "\n".join(lines)
+                + "\n\nRefund: `/refund <id> <wallet>`", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await q.message.reply_text(f"Error: {str(e)[:120]}")
+
+async def refund_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    args = ctx.args
+    if len(args) < 2:
+        await update.effective_message.reply_text(
+            "Usage: `/refund <loan_id> <wallet>`\nReturns that loan's collateral to the wallet.",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+    loan_id, to = args[0], args[1]
+    await update.effective_message.reply_text(f"Refunding `{loan_id}` → `{to[:6]}…` …", parse_mode=ParseMode.MARKDOWN)
+    try:
+        r = await _post(f"/admin/refund/{loan_id}?to={to}&key={ADMIN_KEY}", {})
+        await update.effective_message.reply_text(
+            f"✅ Sent {r.get('amount')} ${r.get('symbol','?')} → `{to[:6]}…`\n{r.get('solscan','')}",
+            parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Refund failed: {str(e)[:150]}")
+
+
 async def route_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.data == "stats": await q.answer(); return await stats(update, ctx)
@@ -436,6 +518,19 @@ async def _post_init(app):
         BotCommand("stats",     "Protocol stats"),
         BotCommand("help",      "How Vaultie works"),
     ])
+    # extra commands visible only to admins
+    for aid in ADMIN_IDS:
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("admin",  "Operator panel"),
+                BotCommand("refund", "Return a loan's collateral"),
+                BotCommand("borrow", "Lock a token, draw SOL"),
+                BotCommand("positions", "View your loans"),
+                BotCommand("stats",  "Protocol stats"),
+                BotCommand("help",   "How Vaultie works"),
+            ], scope=BotCommandScopeChat(chat_id=aid))
+        except Exception as e:
+            log.warning("admin command scope %s: %s", aid, e)
     log.info("bot commands registered")
 
 
@@ -461,6 +556,9 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("positions", positions_entry))
     app.add_handler(CommandHandler("repay", repay_entry))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("refund", refund_cmd))
+    app.add_handler(CallbackQueryHandler(admin_route, pattern="^adm:"))
     app.add_handler(CallbackQueryHandler(route_buttons, pattern="^(stats|positions|help|terms)$"))
     app.add_handler(CallbackQueryHandler(on_repay, pattern="^repay:"))
     app.add_handler(CallbackQueryHandler(on_refresh, pattern="^refresh:"))
