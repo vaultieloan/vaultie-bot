@@ -11,7 +11,7 @@ Env:
 
 Run:  python bot.py   (long-polling; deploy as a Railway "worker" service)
 """
-import os, re, logging
+import os, re, time, logging
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -27,7 +27,35 @@ SITE = os.getenv("VAULTIE_SITE", "https://vaultie.fun")
 
 # protocol params (mirror backend defaults; quote is recomputed on-chain at deposit)
 LTV, LTV_BOOST, INTEREST, LIQ_DROP, CAP = 0.10, 0.15, 0.05, 0.50, 0.10
-ASK_TOKEN, ASK_AMOUNT, CONFIRM = range(3)
+ASK_TOKEN, ASK_AMOUNT, ASK_TERM, CONFIRM = range(4)
+
+# loan terms (fallback; refreshed from GET /api/terms). shorter = cheaper.
+TERMS = [
+    {"key": "2h",  "label": "2 hours", "interest": 0.02},
+    {"key": "1d",  "label": "1 day",   "interest": 0.04},
+    {"key": "1w",  "label": "1 week",  "interest": 0.07},
+    {"key": "1mo", "label": "1 month", "interest": 0.12},
+]
+DEFAULT_TERM = "1w"
+
+def term_by(key):
+    for t in TERMS:
+        if t["key"] == key:
+            return t
+    for t in TERMS:
+        if t["key"] == DEFAULT_TERM:
+            return t
+    return TERMS[0]
+
+async def refresh_terms():
+    global TERMS, DEFAULT_TERM
+    try:
+        d = await _get("/terms")
+        if d.get("terms"):
+            TERMS = d["terms"]
+            DEFAULT_TERM = d.get("default", DEFAULT_TERM)
+    except Exception:
+        pass
 
 
 # ----------------- data helpers -----------------
@@ -102,8 +130,8 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         s = await _get("/protocol/stats")
         txt = ("*Vaultie — live stats*\n\n"
-               f"SOL in liquidity: *{s.get('liquiditySol',0):,.2f} ◎*\n"
-               f"Credit outstanding: *{s.get('creditOutstandingSol',0):,.2f} ◎*\n"
+               f"SOL in liquidity: *{s.get("liquiditySol",0):,.2f} SOL*\n"
+               f"Credit outstanding: *{s.get("creditOutstandingSol",0):,.2f} SOL*\n"
                f"Open positions: *{s.get('activeLiens',0)}*\n"
                f"LP APR: *{s.get('lpApr',0)*100:.1f}%*")
     except Exception:
@@ -112,6 +140,43 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------- positions -----------------
+STATUS_EMOJI = {"pending_deposit": "⌛", "pending_approval": "⌛", "active": "🟢",
+                "awaiting_repayment": "🟡", "repaid": "✅", "liquidated": "🔻",
+                "defaulted": "⛔", "refunded": "↩️", "held": "⏸"}
+
+def _time_left(due):
+    if not due:
+        return ""
+    s = due - time.time()
+    if s <= 0:
+        return "⚠️ overdue"
+    h, m = int(s // 3600), int((s % 3600) // 60)
+    if h >= 24:
+        return f"⏳ {h // 24}d {h % 24}h left"
+    if h:
+        return f"⏳ {h}h {m}m left"
+    return f"⏳ {m}m left"
+
+def _position_view(l):
+    st = l.get("status", "?")
+    sym = l.get("symbol", "?")
+    em = STATUS_EMOJI.get(st, "•")
+    lines = [f"{em} *${sym}* — _{st.replace('_', ' ')}_",
+             f"Collateral: *{l.get('amount', 0):,.0f} ${sym}*",
+             f"Credit drawn: *{l.get('creditSol', 0):.4f} SOL*",
+             f"Repay to unlock: *{l.get('repaySol', 0):.4f} SOL*"]
+    if l.get("termLabel"):
+        tl = _time_left(l.get("dueAt"))
+        lines.append(f"Term: *{l['termLabel']}*" + (f"  ·  {tl}" if tl else ""))
+    kb = None
+    if st == "active":
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"💰 Repay ${sym}", callback_data=f"repay:{l['id']}")]])
+    elif st == "awaiting_repayment":
+        lines.append(f"\n➡️ Send *{l.get('repaySol', 0):.4f} SOL* to:\n`{l.get('repayAddress', '—')}`\n"
+                     f"_Collateral unlocks automatically once it lands._")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh status", callback_data=f"refresh:{l['id']}")]])
+    return "\n".join(lines), kb
+
 async def positions_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.callback_query.message if update.callback_query else update.effective_message
     if update.callback_query: await update.callback_query.answer()
@@ -123,20 +188,72 @@ async def maybe_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ctx.user_data["awaiting_wallet"] = False
     wallet = update.effective_message.text.strip()
+    ctx.user_data["wallet"] = wallet
     try:
         data = await _get("/loans", {"recipient": wallet})
-        loans = data.get("loans", data) if isinstance(data, dict) else data
-        if not loans:
-            await update.effective_message.reply_text("No positions found for that wallet.")
-            return
-        lines = ["*Your positions*\n"]
-        for l in loans[:10]:
-            lines.append(
-                f"• *${l.get('symbol','?')}* — {l.get('status','?')}\n"
-                f"   credit {l.get('creditSol',0)} ◎ · repay {l.get('repaySol',0)} ◎")
-        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception:
-        await update.effective_message.reply_text("Couldn't load positions right now.")
+        await update.effective_message.reply_text("Couldn't load positions right now. Try again."); return
+    loans = data.get("loans", data) if isinstance(data, dict) else data
+    if not loans:
+        await update.effective_message.reply_text(
+            "No positions for that wallet. Open one with /borrow."); return
+    open_st = ("pending_deposit", "pending_approval", "active", "awaiting_repayment", "held")
+    open_loans = [l for l in loans if l.get("status") in open_st]
+    closed = [l for l in loans if l.get("status") not in open_st]
+    await update.effective_message.reply_text(
+        f"*Positions for* `{wallet[:4]}…{wallet[-4:]}`", parse_mode=ParseMode.MARKDOWN)
+    for l in open_loans[:15]:
+        text, kb = _position_view(l)
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    if closed:
+        tail = "\n".join(f"{STATUS_EMOJI.get(l.get('status'),'•')} ${l.get('symbol','?')} — "
+                         f"_{l.get('status','?').replace('_',' ')}_" for l in closed[:10])
+        await update.effective_message.reply_text("*Closed*\n" + tail, parse_mode=ParseMode.MARKDOWN)
+    if not open_loans:
+        await update.effective_message.reply_text("No open positions. Open one with /borrow.")
+
+async def on_repay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    loan_id = q.data.split(":", 1)[1]
+    try:
+        r = await _post(f"/loans/{loan_id}/repay", {})
+    except Exception as e:
+        log.warning("repay failed: %s", e)
+        await q.message.reply_text("Couldn't start repayment right now. Try again in a moment."); return
+    sym = r.get("symbol", "?")
+    if r.get("status") == "awaiting_repayment":
+        await q.message.reply_text(
+            f"*Repay ${sym}* 🟡\n\n"
+            f"Send exactly *{r.get('repaySol', 0):.4f} SOL* to:\n\n"
+            f"`{r.get('repayAddress', '—')}`\n\n"
+            f"From your own wallet. Your *{sym}* collateral is released automatically once the SOL "
+            f"arrives (usually under a minute). Use /positions → 🔄 to check status.",
+            parse_mode=ParseMode.MARKDOWN)
+    elif r.get("status") == "repaid":
+        await q.message.reply_text(f"✅ Repaid — your ${sym} collateral is on its way back to your wallet.")
+    else:
+        await q.message.reply_text("Repayment requested.")
+
+async def on_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    loan_id = q.data.split(":", 1)[1]
+    wallet = ctx.user_data.get("wallet")
+    if not wallet:
+        await q.answer("Send /positions again", show_alert=False); return
+    await q.answer("Refreshing…")
+    try:
+        data = await _get("/loans", {"recipient": wallet})
+    except Exception:
+        await q.message.reply_text("Couldn't refresh. Try /positions again."); return
+    loans = data.get("loans", data) if isinstance(data, dict) else data
+    l = next((x for x in loans if x.get("id") == loan_id), None)
+    if not l:
+        await q.message.reply_text("Position not found."); return
+    text, kb = _position_view(l)
+    try:
+        await q.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 
 # ----------------- borrow conversation -----------------
@@ -186,21 +303,46 @@ async def got_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             f"That exceeds the Smart Cap (max ~${max_lock:,.0f}). Send a smaller amount.")
         return ASK_AMOUNT
-    credit_sol = amount * t["priceSol"] * LTV
-    repay_sol = credit_sol * (1 + INTEREST)
-    liq_price = t["priceSol"] * (1 - LIQ_DROP)
     ctx.user_data["amount"] = amount
+    await refresh_terms()
+    rows, row = [], []
+    for tm in TERMS:
+        row.append(InlineKeyboardButton(f"{tm['label']} · {int(tm['interest']*100)}%",
+                                        callback_data=f"term:{tm['key']}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    await update.effective_message.reply_text(
+        f"*Choose your borrow term — ${t['symbol']}*\n\n"
+        f"Shorter term = lower interest. "
+        f"*If you don't repay within the term, your collateral is forfeited.*",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+    return ASK_TERM
+
+async def got_term(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    key = q.data.split(":", 1)[1]
+    term = term_by(key)
+    ctx.user_data["term"] = term
+    t = ctx.user_data["token"]; amount = ctx.user_data["amount"]
+    value_usd = amount * t["priceUsd"]
+    credit_sol = amount * t["priceSol"] * LTV
+    repay_sol = credit_sol * (1 + term["interest"])
+    liq_price = t["priceSol"] * (1 - LIQ_DROP)
     ctx.user_data["quote"] = {"credit": credit_sol, "repay": repay_sol, "liq": liq_price}
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Confirm", callback_data="confirm"),
         InlineKeyboardButton("✖ Cancel", callback_data="cancel")]])
-    await update.effective_message.reply_text(
+    await q.message.reply_text(
         f"*Quote — ${t['symbol']}*\n\n"
         f"Lock: *{amount:,.0f} ${t['symbol']}* (~${value_usd:,.0f})\n"
         f"LTV: *10%*\n"
-        f"You receive: *{credit_sol:.4f} ◎*\n"
-        f"Repay to unlock: *{repay_sol:.4f} ◎* (×1.05)\n"
-        f"Liquidation price: *{liq_price:.8f} ◎*\n\n"
+        f"Term: *{term['label']}*  ·  interest *{int(term['interest']*100)}%*\n"
+        f"You receive: *{credit_sol:.4f} SOL*\n"
+        f"Repay to unlock: *{repay_sol:.4f} SOL*\n"
+        f"Liquidation price: *{liq_price:.8f} SOL*\n\n"
+        f"⚠ Not repaid within *{term['label']}* → collateral forfeited.\n"
         f"_Final credit is recalculated from the live price when your tokens arrive._",
         parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
     return CONFIRM
@@ -211,8 +353,10 @@ async def confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Cancelled.")
         return ConversationHandler.END
     t = ctx.user_data["token"]; amount = ctx.user_data["amount"]
+    term = ctx.user_data.get("term") or term_by(DEFAULT_TERM)
     try:
-        loan = await _post("/loans", {"tokenAddress": t["address"], "symbol": t["symbol"], "amount": amount})
+        loan = await _post("/loans", {"tokenAddress": t["address"], "symbol": t["symbol"],
+                                      "amount": amount, "term": term["key"]})
     except Exception as e:
         await q.message.reply_text("Couldn't open the position right now. Try again later.")
         log.warning("open loan failed: %s", e)
@@ -222,6 +366,7 @@ async def confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"*Position opened* ✅\n\n"
         f"Send *{amount:,.0f} ${t['symbol']}* from *your own wallet* to:\n\n"
         f"`{lock}`\n\n"
+        f"Term: *{term['label']}* — repay within this window or your collateral is forfeited.\n"
         f"The SOL credit is paid back to the wallet you send from — no address needed. "
         f"Track it any time with *My positions*.\n\n"
         f"⚠ Send only ${t['symbol']} to this address, from a wallet you control (not an exchange).",
@@ -248,6 +393,7 @@ def main():
         states={
             ASK_TOKEN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_token)],
             ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_amount)],
+            ASK_TERM:   [CallbackQueryHandler(got_term, pattern="^term:")],
             CONFIRM:    [CallbackQueryHandler(confirm, pattern="^(confirm|cancel)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -258,6 +404,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("positions", positions_entry))
     app.add_handler(CallbackQueryHandler(route_buttons, pattern="^(stats|positions)$"))
+    app.add_handler(CallbackQueryHandler(on_repay, pattern="^repay:"))
+    app.add_handler(CallbackQueryHandler(on_refresh, pattern="^refresh:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_wallet))
     log.info("Vaultie bot up. API=%s", API)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
