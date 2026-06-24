@@ -432,6 +432,7 @@ def admin_menu():
          InlineKeyboardButton("💾 Volume", callback_data="adm:health")],
         [InlineKeyboardButton("📋 All loans", callback_data="adm:loans"),
          InlineKeyboardButton("⚠️ Stuck", callback_data="adm:stuck")],
+        [InlineKeyboardButton("💰 Deposits (on-chain)", callback_data="adm:deposits")],
     ])
 
 async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -462,27 +463,112 @@ async def admin_route(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"dataDir: `{h.get('dataDir')}`\nonVolume: `{h.get('dataDirOnVolume')}`\n"
                 f"writable: `{h.get('writable')}`\nloans in db: `{h.get('loanCount')}`",
                 parse_mode=ParseMode.MARKDOWN)
-        elif act in ("loans", "stuck"):
+        elif act in ("loans", "stuck") or act.startswith("page:"):
+            if act.startswith("page:"):
+                _, filt, pg = act.split(":"); page = int(pg)
+            else:
+                filt, page = act, 0
             d = await _get("/admin/loans", {"key": ADMIN_KEY})
             loans = d.get("loans", [])
-            if act == "stuck":
+            if filt == "stuck":
                 loans = [l for l in loans if l.get("status") in
-                         ("awaiting_repayment", "pending_deposit", "awaiting_deposit", "held")
-                         or l.get("watchNote")]
+                         ("awaiting_repayment", "pending_deposit", "awaiting_deposit", "held", "pending_approval")]
             if not loans:
-                await q.message.reply_text("No loans." if act == "loans" else "No stuck loans ✅")
+                await q.message.reply_text("No loans." if filt == "loans" else "No stuck loans ✅")
                 return
-            clean = lambda s: str(s).replace("_", " ").replace("*", "").replace("`", "")
-            lines = []
-            for l in loans[-15:]:
-                note = l.get("watchNote") or l.get("repayNote") or (("cap:" + l["held"]) if l.get("held") else "")
-                row = f"`{l.get('id','?')}` · ${clean(l.get('symbol','?'))} · {clean(l.get('status','?'))}"
-                if note:
-                    row += f"\n   ↳ {clean(note)}"
-                lines.append(row)
+            PAGE = 8
+            pages = max(1, (len(loans) + PAGE - 1) // PAGE)
+            page = max(0, min(page, pages - 1))
+            chunk = loans[page * PAGE:(page + 1) * PAGE]
+            rows = [[InlineKeyboardButton(
+                        f"${l.get('symbol','?')} · {str(l.get('status','?')).replace('_',' ')} · {l['id'][:6]}",
+                        callback_data=f"adm:loan:{l['id']}")] for l in chunk]
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("◀", callback_data=f"adm:page:{filt}:{page-1}"))
+            nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="adm:noop"))
+            if page < pages - 1:
+                nav.append(InlineKeyboardButton("▶", callback_data=f"adm:page:{filt}:{page+1}"))
+            rows.append(nav)
+            kb = InlineKeyboardMarkup(rows)
+            title = f"{'⚠️ Stuck' if filt=='stuck' else '📋 Loans'} ({len(loans)}) — tap one for details"
+            if act.startswith("page:"):
+                await q.message.edit_text(title, reply_markup=kb)
+            else:
+                await q.message.reply_text(title, reply_markup=kb)
+        elif act == "noop":
+            pass
+        elif act.startswith("loan:"):
+            lid = act.split(":", 1)[1]
+            l = await _get(f"/loans/{lid}")
+            sym = str(l.get("symbol", "?")).replace("_", " ")
+            amt = l.get("amount") or 0
+            coll = amt * (l.get("entryPriceSol") or 0)
+            note = l.get("watchNote") or l.get("repayNote") or (("cap:" + l["held"]) if l.get("held") else "—")
+            txt = (f"*${sym}* · `{lid}`\n"
+                   f"status: {str(l.get('status','?')).replace('_',' ')}\n"
+                   f"collateral: {amt:,.0f} (~{coll:.3f} SOL)\n"
+                   f"credit: {l.get('creditSol') or 0:.4f} SOL · repay {l.get('repaySol') or 0:.4f}\n"
+                   f"term: {l.get('termLabel','—')} · LTV {(l.get('ltvApplied') or 0)*100:.0f}%\n"
+                   f"note: {str(note).replace('_',' ')}\n"
+                   f"from: `{l.get('fromWallet','—')}`\n"
+                   f"lock: `{l.get('lockAddress','—')}`")
+            if l.get("disburseSig"):
+                txt += f"\n[disburse tx](https://solscan.io/tx/{l['disburseSig']})"
+            if l.get("releaseSig"):
+                txt += f" · [release tx](https://solscan.io/tx/{l['releaseSig']})"
+            btns = []
+            if l.get("fromWallet") and not l.get("disburseSig"):
+                btns.append([InlineKeyboardButton("↩ Refund to sender", callback_data=f"adm:rfd:{lid}")])
+            await q.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
+                                       reply_markup=InlineKeyboardMarkup(btns) if btns else None)
+        elif act.startswith("rfdok:"):
+            lid = act.split(":", 1)[1]
+            l = await _get(f"/loans/{lid}")
+            to = l.get("fromWallet")
+            await q.message.reply_text(f"Refunding `{lid}` → `{to[:8]}…`…", parse_mode=ParseMode.MARKDOWN)
+            try:
+                r = await _post(f"/admin/refund/{lid}?to={to}&key={ADMIN_KEY}", {})
+                await q.message.reply_text(f"✅ Sent → {r.get('solscan','done')}")
+            except httpx.HTTPStatusError as e:
+                detail = ""
+                try:
+                    detail = e.response.json().get("detail", "")
+                except Exception:
+                    detail = (e.response.text or "")[:200]
+                await q.message.reply_text(f"Refund failed ({e.response.status_code}): {detail}")
+        elif act.startswith("rfd:"):
+            lid = act.split(":", 1)[1]
+            l = await _get(f"/loans/{lid}")
+            to = l.get("fromWallet")
+            if not to:
+                await q.message.reply_text("No sender wallet on this loan.")
+                return
             await q.message.reply_text(
-                f"*{'Stuck' if act=='stuck' else 'Loans'}* ({len(loans)})\n" + "\n".join(lines)
-                + "\n\nRefund: `/refund <id> <wallet>`", parse_mode=ParseMode.MARKDOWN)
+                f"Refund {l.get('amount',0):,.0f} ${l.get('symbol','?')} to sender?\n`{to}`",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm refund", callback_data=f"adm:rfdok:{lid}")]]))
+        elif act == "deposits":
+            await q.message.reply_text("Reading on-chain balances… (a few seconds)")
+            d = await _get("/admin/deposits", {"key": ADMIN_KEY})
+            deps = d.get("deposits", [])
+            withtok = [x for x in deps if x.get("hasTokens")]
+            clean = lambda s: str(s).replace("_", " ").replace("*", "").replace("`", "")
+            if not withtok:
+                await q.message.reply_text(
+                    f"Scanned {d.get('scanned',0)} unpaid loans.\n"
+                    f"*No deposits with tokens on-chain.* ✅\nNothing is stuck — those are empty quotes.",
+                    parse_mode=ParseMode.MARKDOWN)
+                return
+            lines = []
+            for x in withtok:
+                lines.append(
+                    f"`{clean(x['id'])}` · ${clean(x.get('symbol','?'))}\n"
+                    f"   ↳ tokens {x.get('onchain',0):,.0f} / {x.get('needed',0):,.0f} · NOT paid\n"
+                    f"   ↳ from `{(x.get('fromWallet') or '')[:8]}…`")
+            await q.message.reply_text(
+                f"*Deposits stuck with tokens* ({len(withtok)})\n\n" + "\n".join(lines)
+                + "\n\nReturn to user: `/refund <id> <wallet>`", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await q.message.reply_text(f"Error: {str(e)[:120]}")
 
@@ -502,6 +588,14 @@ async def refund_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             f"✅ Sent {r.get('amount')} ${r.get('symbol','?')} → `{to[:6]}…`\n{r.get('solscan','')}",
             parse_mode=ParseMode.MARKDOWN)
+    except httpx.HTTPStatusError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            detail = (e.response.text or "")[:200]
+        await update.effective_message.reply_text(
+            f"Refund failed ({e.response.status_code}): {detail or 'see Railway logs'}")
     except Exception as e:
         await update.effective_message.reply_text(f"Refund failed: {str(e)[:150]}")
 
