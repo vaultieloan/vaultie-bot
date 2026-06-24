@@ -433,6 +433,7 @@ def admin_menu():
         [InlineKeyboardButton("📋 All loans", callback_data="adm:loans"),
          InlineKeyboardButton("⚠️ Stuck", callback_data="adm:stuck")],
         [InlineKeyboardButton("💰 Deposits (on-chain)", callback_data="adm:deposits")],
+        [InlineKeyboardButton("🧹 Sweep deposits → treasury", callback_data="adm:sweep")],
     ])
 
 async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -498,6 +499,27 @@ async def admin_route(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.message.reply_text(title, reply_markup=kb)
         elif act == "noop":
             pass
+        elif act == "sweep":
+            await q.message.reply_text(
+                "🧹 *Sweep deposits to treasury*\n\n"
+                "Scans UNPAID loans that still hold tokens and sends that collateral to the treasury "
+                "(funding gas from treasury where needed). Active/disbursed loans are not touched.\n\n"
+                "This is irreversible. Proceed?",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Run sweep", callback_data="adm:sweepok")]]))
+        elif act == "sweepok":
+            await q.message.reply_text("Sweeping… (gas top-ups confirm next pass)")
+            r = await _post(f"/admin/sweep-deposits?key={ADMIN_KEY}&limit=8", {})
+            swept = r.get("swept", [])
+            lines = [f"✅ {s.get('amount',0):,.0f} ${str(s.get('symbol','?')).replace('_',' ')} → treasury"
+                     for s in swept] or ["Nothing swept this pass."]
+            extra = []
+            if r.get("gassed"): extra.append(f"⛽ gassed {len(r['gassed'])} (sweep next run)")
+            if r.get("failed"): extra.append(f"⚠️ failed {len(r['failed'])}")
+            if r.get("more"): extra.append("↻ more left — tap Sweep again")
+            await q.message.reply_text(
+                "*Sweep result*\n" + "\n".join(lines) + ("\n\n" + " · ".join(extra) if extra else ""),
+                parse_mode=ParseMode.MARKDOWN)
         elif act.startswith("loan:"):
             lid = act.split(":", 1)[1]
             l = await _get(f"/loans/{lid}")
